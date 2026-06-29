@@ -29,22 +29,59 @@ The certifier never holds risk and never sees real customer data: all probe data
 
 ## Architecture
 
+End-to-end flow — a request enters through UiPath, gets scored and signed by the VerifyAI backend, and is independently verifiable on the public page.
+
+```mermaid
+flowchart LR
+    subgraph UIP["UiPath Automation Cloud"]
+        AW["verifyaiSweep API Workflow<br/>inputs: account_id, workflow_id"]
+    end
+
+    subgraph VAI["VerifyAI backend — Modal / FastAPI"]
+        SW["Determinism sweep<br/>N runs, temperature 0"]
+        CM["Compliance mapping<br/>GLBA / SOC 2"]
+        SG["Ed25519 signing<br/>signs every ledger entry"]
+    end
+
+    subgraph PUB["Public verification — Vercel"]
+        VP["/verify page"]
+        KEY["/.well-known/issuer-keys.json"]
+    end
+
+    CC["Claude Code + uip skills<br/>UiPath for Coding Agents"]
+
+    AW -->|GET| SW
+    SW --> CM --> SG
+    SG -->|signed cert| AW
+    SG -.published key.-> KEY
+    VP -->|checks signature| KEY
+    CC -.deploys / inspects.-> AW
 ```
-UiPath Automation Cloud
-  └─ API Workflow: verifyaiSweep
-       inputs: account_id, workflow_id
-       │
-       ▼ HTTPS GET
-VerifyAI backend (Modal, FastAPI)
-  ├─ determinism sweep (N runs, temperature 0)
-  ├─ compliance mapping (GLBA / SOC 2 / others)
-  ├─ Ed25519 signing of every ledger entry on write
-  └─ certificate endpoint (verify=true returns a verification block)
-       │
-       ▼ published issuer key
-Vercel frontend
-  ├─ /.well-known/issuer-keys.json   (public Ed25519 key)
-  └─ /verify                         (paste account/workflow, see the signed verdict)
+
+Layered by platform tier — what runs where.
+
+```mermaid
+flowchart TB
+    subgraph L1["UiPath platform — orchestration & governance"]
+        AW["verifyaiSweep<br/>API Workflow"]
+        AG["Verdict agent<br/>autonomous · in progress"]
+    end
+
+    subgraph L2["VerifyAI service — Modal"]
+        DS["Determinism sweep"]
+        CP["Compliance mapping"]
+        ED["Ed25519 signing"]
+    end
+
+    subgraph L3["Public verification — Vercel"]
+        VF["/verify page"]
+        IK["issuer-keys.json"]
+    end
+
+    AW --> L2
+    DS --> CP --> ED
+    ED --> L3
+    VF -.verifies.-> IK
 ```
 
 VerifyAI stays orchestrator-agnostic. UiPath is one orchestrator it plugs into; the integration is one-way reversible and does not couple VerifyAI to UiPath.
@@ -90,6 +127,44 @@ Returns a verification block:
 
 The signature is checked against the public key published at the `public_key_url`. Tamper with any signed field and verification returns `valid: false`.
 
+### Request sequence
+
+```mermaid
+sequenceDiagram
+    participant U as UiPath API Workflow
+    participant M as VerifyAI backend (Modal)
+    participant L as Signed ledger
+    participant V as Public verify page
+
+    U->>M: GET certificate (account_id, workflow_id)
+    M->>M: Run determinism sweep (N runs)
+    M->>M: Map compliance framework
+    M->>L: Sign entry (Ed25519) and write
+    M-->>U: Return signed certificate
+    Note over U: determinism_score, verification, signer_key_id
+    V->>M: Fetch cert with verify=true
+    M-->>V: verification.valid = true
+    V->>V: Check signature vs published key
+```
+
+---
+
+## How the determinism test decides
+
+Instead of asserting fixed outputs — which non-deterministic AI agents will never satisfy — VerifyAI runs the agent N times and scores decision stability and output drift.
+
+```mermaid
+flowchart TD
+    START["Agent under test"] --> RUN["Run N times<br/>temperature 0"]
+    RUN --> MEASURE["Measure decision stability<br/>and output drift"]
+    MEASURE --> SCORE{"determinism_score"}
+    SCORE -->|>= 0.95| PASS["Pass<br/>issue signed cert"]
+    SCORE -->|0.85 to 0.95| FLAG["Conditional<br/>cert with caveats"]
+    SCORE -->|< 0.85| REVIEW["Recommend human review"]
+    PASS --> CERT["Ed25519 signed certificate"]
+    FLAG --> CERT
+```
+
 ---
 
 ## Design partner
@@ -105,6 +180,19 @@ The signature is checked against the public key published at the `public_key_url
 | **API Workflows** | `verifyaiSweep` — parameterized (`account_id`, `workflow_id`), HTTP Request to the VerifyAI backend, Response activity returns the signed certificate |
 | **Test Cloud** | The integration runs as an agentic testing layer that scores an agent and issues a certificate |
 | **Agent (Autonomous)** | A verdict-writer agent that reads the certificate and writes a one-paragraph compliance verdict — see Status below |
+
+### Coding agents — UiPath for Coding Agents (bonus)
+
+The UiPath skill catalog is installed into Claude Code (`uip skills install --agent claude`), authenticated to the `darwinadaptivesystemsllc / DefaultTenant` tenant. Claude Code operates the platform directly from the terminal — enumerating Orchestrator feeds, listing published packages, and deploying the API Workflow — blending a coding agent with the low-code component that bridges to the external VerifyAI service.
+
+```mermaid
+flowchart LR
+    DEV["Operator"] -->|natural language| CC["Claude Code"]
+    CC -->|uip skills installed| SK["22 UiPath skills<br/>api-workflow, solution, troubleshoot"]
+    SK --> UIP["uip CLI<br/>authenticated to tenant"]
+    UIP -->|lists / inspects / deploys| ORCH["UiPath Orchestrator<br/>feeds, packages, jobs"]
+    ORCH -.operates.-> AW["verifyaiSweep<br/>API Workflow"]
+```
 
 ---
 
